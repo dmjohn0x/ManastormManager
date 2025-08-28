@@ -1,0 +1,8 @@
+## Interface: 30300
+## Title: Manastorm Manager
+## Notes: Opens multiple Manastorm Caches with a single command
+## Version: 1.0
+## Author: DM0X
+## SavedVariables: ManastormManagerDB
+
+ManastormManager-1.0.lua
