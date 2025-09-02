@@ -274,6 +274,17 @@ local function OpenCache(bag, slot, isAutoOpen)
     local itemLink = GetContainerItemLink(bag, slot)
     local itemName = itemLink and GetItemInfo(itemLink) or "Unknown Cache"
     
+    -- Safety check: Verify this is actually a cache before using it
+    if itemLink and itemName then
+        local isManastormCache = string.find(itemName, "Manastorm") and string.find(itemName, "Cache")
+        local isAdventurerCache = ManastormManagerDB.adventureMode and string.find(itemName, "Adventurer") and string.find(itemName, "Cache")
+        
+        if not (isManastormCache or isAdventurerCache) then
+            DebugPrint("WARNING: Attempted to open non-cache item: " .. itemName .. " at bag " .. bag .. " slot " .. slot)
+            return  -- Don't open non-cache items
+        end
+    end
+    
     DebugPrint("Opening " .. itemName .. " at bag " .. bag .. " slot " .. slot)
     UseContainerItem(bag, slot)
     currentlyOpening = currentlyOpening + 1
@@ -305,10 +316,36 @@ local function ProcessQueue(isAutoOpen)
         local cache = table.remove(openQueue, 1)
         DebugPrint("Processing cache at bag " .. cache.bag .. " slot " .. cache.slot)
         
-        -- Verify the cache is still there
+        -- Verify the cache is still there and is actually a cache
         local texture, itemCount, locked = GetContainerItemInfo(cache.bag, cache.slot)
         if texture then
-            if locked then
+            -- Double-check that this is still a cache item
+            local itemLink = GetContainerItemLink(cache.bag, cache.slot)
+            local isStillCache = false
+            if itemLink then
+                local itemName = GetItemInfo(itemLink)
+                if itemName then
+                    local isManastormCache = string.find(itemName, "Manastorm") and string.find(itemName, "Cache")
+                    local isAdventurerCache = ManastormManagerDB.adventureMode and string.find(itemName, "Adventurer") and string.find(itemName, "Cache")
+                    isStillCache = isManastormCache or isAdventurerCache
+                end
+            end
+            
+            if not isStillCache then
+                -- Item in this slot is no longer a cache (probably got replaced by loot)
+                DebugPrint("Item at bag " .. cache.bag .. " slot " .. cache.slot .. " is no longer a cache, skipping")
+                -- Continue immediately
+                local timer = CreateFrame("Frame")
+                local elapsed = 0
+                timer:SetScript("OnUpdate", function(self, elapsedTime)
+                    elapsed = elapsed + elapsedTime
+                    if elapsed >= 0.1 then
+                        timer:SetScript("OnUpdate", nil)
+                        isProcessingQueue = false
+                        ProcessQueue(isAutoOpen)
+                    end
+                end)
+            elseif locked then
                 -- If locked, put it back at the end of the queue and continue with next
                 DebugPrint("Cache is locked, requeueing and continuing")
                 table.insert(openQueue, cache)
@@ -795,201 +832,19 @@ local function DecodeItemList(importStr)
     return items, listType, nil
 end
 
--- Global reference to prevent multiple windows
-local importExportFrame = nil
-
--- Create Import/Export popup window
-local function ShowImportExportWindow(title, text, isImport, listType)
-    -- Close existing window if open
-    if importExportFrame and importExportFrame:IsVisible() then
-        importExportFrame:Hide()
-    end
-    
-    local currentTheme = ManastormManagerDB.dockTheme or "blizzard"
-    
-    -- Create frame
-    local frame = CreateFrame("Frame", "ManastormImportExportFrame", UIParent)
-    importExportFrame = frame  -- Store global reference
-    frame:SetSize(400, 300)
-    frame:SetPoint("CENTER")
-    frame:SetFrameStrata("DIALOG")
-    frame:EnableMouse(true)
-    frame:SetMovable(true)
-    frame:RegisterForDrag("LeftButton")
-    frame:SetScript("OnDragStart", frame.StartMoving)
-    frame:SetScript("OnDragStop", frame.StopMovingOrSizing)
-    
-    -- Apply theme
-    if currentTheme == "elvui" then
-        frame:SetBackdrop({
-            bgFile = "Interface\\ChatFrame\\ChatFrameBackground",
-            edgeFile = "Interface\\Buttons\\WHITE8X8",
-            tile = true, tileSize = 16, edgeSize = 2,
-            insets = {left = 2, right = 2, top = 2, bottom = 2}
-        })
-        frame:SetBackdropColor(0.05, 0.05, 0.05, 0.9)
-        frame:SetBackdropBorderColor(0, 0, 0, 1)
-    else
-        frame:SetBackdrop({
-            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
-            edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
-            tile = true, tileSize = 32, edgeSize = 32,
-            insets = {left = 11, right = 12, top = 12, bottom = 11}
-        })
-    end
-    
-    -- Title
-    local titleText = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-    titleText:SetPoint("TOP", 0, -15)
-    titleText:SetText(title)
-    if currentTheme == "elvui" then
-        titleText:SetTextColor(1, 1, 1, 1)
-    end
-    
-    -- Close X button in corner
-    local closeXButton = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
-    closeXButton:SetPoint("TOPRIGHT", -5, -5)
-    closeXButton:SetScript("OnClick", function()
-        frame:Hide()
-    end)
-    
-    -- Scrollable text area
-    local scrollFrame = CreateFrame("ScrollFrame", nil, frame, "UIPanelScrollFrameTemplate")
-    scrollFrame:SetPoint("TOPLEFT", 20, -45)
-    scrollFrame:SetPoint("BOTTOMRIGHT", -40, 80)
-    
-    local editBox = CreateFrame("EditBox", nil, scrollFrame)
-    editBox:SetMultiLine(true)
-    editBox:SetAutoFocus(true)
-    editBox:SetFontObject(ChatFontNormal)
-    editBox:SetWidth(scrollFrame:GetWidth())
-    editBox:SetText(text or "")
-    scrollFrame:SetScrollChild(editBox)
-    
-    -- Auto-size the editBox height
-    editBox:SetScript("OnTextChanged", function(self)
-        local text = self:GetText()
-        local lines = 1
-        for i = 1, string.len(text) do
-            if string.sub(text, i, i) == "\n" then
-                lines = lines + 1
-            end
-        end
-        self:SetHeight(math.max(lines * 14, scrollFrame:GetHeight()))
-    end)
-    
-    if isImport then
-        editBox:SetText("Paste your import string here...")
-        editBox:SetScript("OnEditFocusGained", function(self)
-            if self:GetText() == "Paste your import string here..." then
-                self:SetText("")
-            end
-        end)
-        editBox:SetScript("OnEditFocusLost", function(self)
-            if self:GetText() == "" then
-                self:SetText("Paste your import string here...")
-            end
-        end)
-    else
-        -- For export, select all text
-        editBox:SetScript("OnShow", function(self)
-            self:HighlightText()
-        end)
-    end
-    
-    -- Buttons
-    if isImport then
-        -- Import button
-        local importButton
-        if currentTheme == "elvui" then
-            importButton = CreateElvUIButton(frame, "Import", false)
-        else
-            importButton = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-            importButton:SetText("Import")
-        end
-        importButton:SetSize(100, 25)
-        importButton:SetPoint("BOTTOM", -55, 15)
-        importButton:SetScript("OnClick", function()
-            local importString = editBox:GetText()
-            if importString and importString ~= "Paste your import string here..." and importString ~= "" then
-                local success, message = ImportItemList(importString)
-                Print(message)
-                if success then
-                    frame:Hide()
-                    -- Refresh the appropriate list if it's open
-                    if listType == "PROTECTED" and protectedItemsFrame and protectedItemsFrame:IsVisible() and protectedItemsFrame.RefreshList then
-                        protectedItemsFrame.RefreshList()
-                    elseif listType == "AUTOSELL" and autoVendingFrame and autoVendingFrame:IsVisible() and autoVendingFrame.RefreshList then
-                        autoVendingFrame.RefreshList()
-                    end
-                end
-            else
-                Print("Please paste an import string first!")
-            end
-        end)
-        
-        -- Close button for import
-        local closeButton
-        if currentTheme == "elvui" then
-            closeButton = CreateElvUIButton(frame, "Close", false)
-        else
-            closeButton = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-            closeButton:SetText("Close")
-        end
-        closeButton:SetSize(100, 25)
-        closeButton:SetPoint("BOTTOM", 55, 15)
-        closeButton:SetScript("OnClick", function()
-            frame:Hide()
-        end)
-    else
-        -- Close button for export (centered)
-        local closeButton
-        if currentTheme == "elvui" then
-            closeButton = CreateElvUIButton(frame, "Close", false)
-        else
-            closeButton = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-            closeButton:SetText("Close")
-        end
-        closeButton:SetSize(100, 25)
-        closeButton:SetPoint("BOTTOM", 0, 15)
-        closeButton:SetScript("OnClick", function()
-            frame:Hide()
-        end)
-    end
-    
-    frame:Show()
-    return frame
-end
-
--- Export protected items
-local function ExportProtectedItems()
-    local exportStr = EncodeItemList(ManastormManagerDB.protectedItems, "PROTECTED")
-    if exportStr == "" then
-        Print("No protected items to export.")
-        return
-    end
-    
-    ShowImportExportWindow("Export Protected Items", exportStr, false, "PROTECTED")
-end
-
--- Export auto-sell items  
-local function ExportAutoSellItems()
-    local exportStr = EncodeItemList(ManastormManagerDB.autoSellItems, "AUTOSELL")
-    if exportStr == "" then
-        Print("No auto-sell items to export.")
-        return
-    end
-    
-    ShowImportExportWindow("Export Auto-Sell Items", exportStr, false, "AUTOSELL")
-end
+-- Forward declaration for ImportItemList
+local ImportItemList
 
 -- Import items from string
-local function ImportItemList(importStr)
+ImportItemList = function(importStr)
+    Print("DEBUG: ImportItemList called with string of length: " .. string.len(importStr or ""))
     local items, listType, error = DecodeItemList(importStr)
     
     if error then
+        Print("DEBUG: DecodeItemList returned error: " .. error)
         return false, "Import failed: " .. error
     end
+    Print("DEBUG: DecodeItemList successful, listType: " .. (listType or "nil"))
     
     -- Ensure database tables are initialized
     if not ManastormManagerDB.protectedItems then
@@ -1052,6 +907,344 @@ local function ImportItemList(importStr)
     else
         return false, "Unknown import type: " .. (listType or "nil")
     end
+end
+
+-- Global reference to prevent multiple windows
+local importExportFrame = nil
+
+-- Create ElvUI-style button
+local function CreateElvUIButton(parent, text, hasLightBorder)
+    local button = CreateFrame("Button", nil, parent)
+    button:SetNormalFontObject("GameFontNormal")
+    button:SetHighlightFontObject("GameFontHighlight")
+    
+    -- Create backdrop
+    if hasLightBorder then
+        -- Light gray border for Options button
+        button:SetBackdrop({
+            bgFile = "Interface\\Buttons\\WHITE8X8",
+            edgeFile = "Interface\\Buttons\\WHITE8X8",
+            tile = false, tileSize = 0, edgeSize = 1,
+            insets = { left = 0, right = 0, top = 0, bottom = 0 }
+        })
+        button:SetBackdropColor(0.1, 0.1, 0.1, 0.8)
+        button:SetBackdropBorderColor(0.6, 0.6, 0.6, 1)  -- Light gray border
+    else
+        -- No border for main buttons
+        button:SetBackdrop({
+            bgFile = "Interface\\Buttons\\WHITE8X8",
+            tile = false, tileSize = 0,
+            insets = { left = 0, right = 0, top = 0, bottom = 0 }
+        })
+        button:SetBackdropColor(0.1, 0.1, 0.1, 0.8)
+    end
+    
+    -- Set text
+    button:SetText(text)
+    local fontString = button:GetFontString()
+    fontString:SetTextColor(1, 1, 1, 1)
+    fontString:SetPoint("CENTER", 0, 0)
+    
+    -- Hover effect
+    button:SetScript("OnEnter", function(self)
+        self:SetBackdropColor(0, 0.7, 0.9, 0.3)  -- Cyan glow
+        if hasLightBorder then
+            self:SetBackdropBorderColor(0, 0.7, 0.9, 1)  -- Cyan border on hover
+        end
+        fontString:SetTextColor(0, 0.9, 1, 1)  -- Cyan text
+    end)
+    
+    button:SetScript("OnLeave", function(self)
+        self:SetBackdropColor(0.1, 0.1, 0.1, 0.8)
+        if hasLightBorder then
+            self:SetBackdropBorderColor(0.6, 0.6, 0.6, 1)  -- Back to light gray border
+        end
+        fontString:SetTextColor(1, 1, 1, 1)
+    end)
+    
+    -- Click effect
+    button:SetScript("OnMouseDown", function(self)
+        fontString:SetPoint("CENTER", 1, -1)
+    end)
+    
+    button:SetScript("OnMouseUp", function(self)
+        fontString:SetPoint("CENTER", 0, 0)
+    end)
+    
+    return button
+end
+
+-- Create Import/Export popup window
+local function ShowImportExportWindow(title, text, isImport, listType)
+    -- Close existing window if open
+    if importExportFrame then
+        importExportFrame:Hide()
+        importExportFrame = nil
+    end
+    
+    local currentTheme = ManastormManagerDB.dockTheme or "blizzard"
+    
+    -- Create frame
+    local frame = CreateFrame("Frame", "ManastormImportExportFrame", UIParent)
+    importExportFrame = frame  -- Store global reference
+    frame:SetSize(400, 400)
+    frame:SetPoint("CENTER")
+    frame:SetFrameStrata("DIALOG")
+    frame:EnableMouse(true)
+    frame:SetMovable(true)
+    frame:RegisterForDrag("LeftButton")
+    frame:SetScript("OnDragStart", frame.StartMoving)
+    frame:SetScript("OnDragStop", frame.StopMovingOrSizing)
+    
+    -- Apply theme
+    if currentTheme == "elvui" then
+        frame:SetBackdrop({
+            bgFile = "Interface\\ChatFrame\\ChatFrameBackground",
+            edgeFile = "Interface\\Buttons\\WHITE8X8",
+            tile = true, tileSize = 16, edgeSize = 2,
+            insets = {left = 2, right = 2, top = 2, bottom = 2}
+        })
+        frame:SetBackdropColor(0.05, 0.05, 0.05, 0.9)
+        frame:SetBackdropBorderColor(0, 0, 0, 1)
+    else
+        frame:SetBackdrop({
+            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+            tile = true, tileSize = 32, edgeSize = 32,
+            insets = {left = 11, right = 12, top = 12, bottom = 11}
+        })
+    end
+    
+    -- Title
+    local titleText = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    titleText:SetPoint("TOP", 0, -15)
+    titleText:SetText(title)
+    if currentTheme == "elvui" then
+        titleText:SetTextColor(1, 1, 1, 1)
+    end
+    
+    -- Close X button in corner
+    local closeXButton = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
+    closeXButton:SetPoint("TOPRIGHT", -5, -5)
+    closeXButton:SetScript("OnClick", function()
+        frame:Hide()
+    end)
+    
+    -- Text input area (fixed size, not scrollable for import)
+    local editBox
+    if isImport then
+        -- For import: create a scrollable text input area
+        local scrollFrame = CreateFrame("ScrollFrame", nil, frame, "UIPanelScrollFrameTemplate")
+        scrollFrame:SetSize(360, 250)
+        scrollFrame:SetPoint("TOP", 0, -50)
+        
+        editBox = CreateFrame("EditBox", nil, scrollFrame)
+        editBox:SetMultiLine(true)
+        editBox:SetAutoFocus(false)  -- Don't auto-focus to avoid issues
+        editBox:SetFontObject(ChatFontNormal)
+        editBox:SetWidth(340)
+        editBox:SetText(text or "")
+        editBox:EnableMouse(true)
+        editBox:SetMaxLetters(0)  -- No character limit
+        scrollFrame:SetScrollChild(editBox)
+        
+        -- Set minimum height for the editBox
+        editBox:SetHeight(250)
+        
+        -- Enable paste functionality
+        editBox:SetScript("OnEscapePressed", function(self)
+            self:ClearFocus()
+        end)
+        
+        -- Click to focus
+        editBox:SetScript("OnMouseDown", function(self)
+            self:SetFocus()
+        end)
+        
+        -- Apply theme-appropriate backdrop to the scroll frame
+        if currentTheme == "elvui" then
+            scrollFrame:SetBackdrop({
+                bgFile = "Interface\\ChatFrame\\ChatFrameBackground",
+                edgeFile = "Interface\\Buttons\\WHITE8X8",
+                tile = true, tileSize = 16, edgeSize = 1,
+                insets = {left = 3, right = 3, top = 3, bottom = 3}
+            })
+            scrollFrame:SetBackdropColor(0.1, 0.1, 0.1, 0.9)
+            scrollFrame:SetBackdropBorderColor(0.3, 0.3, 0.3, 1)
+        else
+            scrollFrame:SetBackdrop({
+                bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+                edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+                tile = true, tileSize = 16, edgeSize = 12,
+                insets = {left = 3, right = 3, top = 3, bottom = 3}
+            })
+        end
+    else
+        -- For export: scrollable text area
+        local scrollFrame = CreateFrame("ScrollFrame", nil, frame, "UIPanelScrollFrameTemplate")
+        scrollFrame:SetPoint("TOPLEFT", 20, -45)
+        scrollFrame:SetPoint("BOTTOMRIGHT", -40, 80)
+        
+        editBox = CreateFrame("EditBox", nil, scrollFrame)
+        editBox:SetMultiLine(true)
+        editBox:SetAutoFocus(true)
+        editBox:SetFontObject(ChatFontNormal)
+        editBox:SetWidth(scrollFrame:GetWidth())
+        editBox:SetText(text or "")
+        scrollFrame:SetScrollChild(editBox)
+        
+        -- Auto-size the editBox height (only for export mode)
+        editBox:SetScript("OnTextChanged", function(self)
+            local text = self:GetText()
+            local lines = 1
+            for i = 1, string.len(text) do
+                if string.sub(text, i, i) == "\n" then
+                    lines = lines + 1
+                end
+            end
+            self:SetHeight(math.max(lines * 14, scrollFrame:GetHeight()))
+        end)
+    end
+    
+    if isImport then
+        editBox:SetText("Paste your import string here...")
+        editBox:SetScript("OnEditFocusGained", function(self)
+            if self:GetText() == "Paste your import string here..." then
+                self:SetText("")
+            end
+        end)
+        editBox:SetScript("OnEditFocusLost", function(self)
+            if self:GetText() == "" then
+                self:SetText("Paste your import string here...")
+            end
+        end)
+    else
+        -- For export, select all text
+        editBox:SetScript("OnShow", function(self)
+            self:HighlightText()
+        end)
+    end
+    
+    -- Buttons
+    if isImport then
+        -- Paste helper text
+        local pasteHelp = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        pasteHelp:SetPoint("TOP", scrollFrame, "BOTTOM", 0, -5)
+        pasteHelp:SetText("Click in the text box above, then press Ctrl+V to paste")
+        if currentTheme == "elvui" then
+            pasteHelp:SetTextColor(0.7, 0.7, 0.7, 1)
+        else
+            pasteHelp:SetTextColor(0.6, 0.6, 0.6, 1)
+        end
+        
+        -- Import button
+        local importButton
+        if currentTheme == "elvui" then
+            importButton = CreateElvUIButton(frame, "Import", false)
+            importButton:SetFrameLevel(frame:GetFrameLevel() + 2)
+            Print("DEBUG: Created ElvUI Import button at frame level " .. importButton:GetFrameLevel())
+        else
+            importButton = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+            importButton:SetText("Import")
+            importButton:SetFrameLevel(frame:GetFrameLevel() + 2)
+        end
+        importButton:SetSize(100, 25)
+        importButton:SetPoint("BOTTOM", -55, 30)
+        importButton:Show()
+        importButton:SetScript("OnClick", function()
+            local importString = editBox:GetText()
+            Print("DEBUG: Import button clicked. String length: " .. string.len(importString or ""))
+            if importString and importString ~= "Paste your import string here..." and importString ~= "" then
+                Print("DEBUG: Calling ImportItemList with string starting with: " .. string.sub(importString, 1, 20))
+                local success, message = ImportItemList(importString)
+                Print(message or "No message returned from ImportItemList")
+                if success then
+                    frame:Hide()
+                    -- Refresh the appropriate list if it's open
+                    if listType == "PROTECTED" and protectedItemsFrame and protectedItemsFrame:IsVisible() and protectedItemsFrame.RefreshList then
+                        protectedItemsFrame.RefreshList()
+                    elseif listType == "AUTOSELL" and autoVendingFrame and autoVendingFrame:IsVisible() and autoVendingFrame.RefreshList then
+                        autoVendingFrame.RefreshList()
+                    end
+                end
+            else
+                Print("Please paste an import string first!")
+            end
+        end)
+        
+        -- Close button for import
+        local closeButton
+        if currentTheme == "elvui" then
+            closeButton = CreateElvUIButton(frame, "Close", false)
+            closeButton:SetFrameLevel(frame:GetFrameLevel() + 2)
+            Print("DEBUG: Created ElvUI Close button at frame level " .. closeButton:GetFrameLevel())
+        else
+            closeButton = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+            closeButton:SetText("Close")
+            closeButton:SetFrameLevel(frame:GetFrameLevel() + 2)
+        end
+        closeButton:SetSize(100, 25)
+        closeButton:SetPoint("BOTTOM", 55, 30)
+        closeButton:Show()
+        closeButton:SetScript("OnClick", function()
+            frame:Hide()
+        end)
+    else
+        -- Copy to Clipboard button for export
+        local copyButton
+        if currentTheme == "elvui" then
+            copyButton = CreateElvUIButton(frame, "Copy All", false)
+        else
+            copyButton = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+            copyButton:SetText("Copy All")
+        end
+        copyButton:SetSize(100, 25)
+        copyButton:SetPoint("BOTTOM", -55, 15)
+        copyButton:SetScript("OnClick", function()
+            editBox:SetFocus()
+            editBox:HighlightText()
+            Print("Export string selected. Press Ctrl+C to copy to clipboard.")
+        end)
+        
+        -- Close button for export
+        local closeButton
+        if currentTheme == "elvui" then
+            closeButton = CreateElvUIButton(frame, "Close", false)
+        else
+            closeButton = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+            closeButton:SetText("Close")
+        end
+        closeButton:SetSize(100, 25)
+        closeButton:SetPoint("BOTTOM", 55, 15)
+        closeButton:SetScript("OnClick", function()
+            frame:Hide()
+        end)
+    end
+    
+    frame:Show()
+    return frame
+end
+
+-- Export protected items
+local function ExportProtectedItems()
+    local exportStr = EncodeItemList(ManastormManagerDB.protectedItems, "PROTECTED")
+    if exportStr == "" then
+        Print("No protected items to export.")
+        return
+    end
+    
+    ShowImportExportWindow("Export Protected Items", exportStr, false, "PROTECTED")
+end
+
+-- Export auto-sell items  
+local function ExportAutoSellItems()
+    local exportStr = EncodeItemList(ManastormManagerDB.autoSellItems, "AUTOSELL")
+    if exportStr == "" then
+        Print("No auto-sell items to export.")
+        return
+    end
+    
+    ShowImportExportWindow("Export Auto-Sell Items", exportStr, false, "AUTOSELL")
 end
 
 -- Format copper into gold, silver, copper display
@@ -1288,66 +1481,6 @@ local function CountVendorItems()
 end
 
 -- Create ElvUI-style button
-local function CreateElvUIButton(parent, text, hasLightBorder)
-    local button = CreateFrame("Button", nil, parent)
-    button:SetNormalFontObject("GameFontNormal")
-    button:SetHighlightFontObject("GameFontHighlight")
-    
-    -- Create backdrop
-    if hasLightBorder then
-        -- Light gray border for Options button
-        button:SetBackdrop({
-            bgFile = "Interface\\Buttons\\WHITE8X8",
-            edgeFile = "Interface\\Buttons\\WHITE8X8",
-            tile = false, tileSize = 0, edgeSize = 1,
-            insets = { left = 0, right = 0, top = 0, bottom = 0 }
-        })
-        button:SetBackdropColor(0.1, 0.1, 0.1, 0.8)
-        button:SetBackdropBorderColor(0.6, 0.6, 0.6, 1)  -- Light gray border
-    else
-        -- No border for main buttons
-        button:SetBackdrop({
-            bgFile = "Interface\\Buttons\\WHITE8X8",
-            tile = false, tileSize = 0,
-            insets = { left = 0, right = 0, top = 0, bottom = 0 }
-        })
-        button:SetBackdropColor(0.1, 0.1, 0.1, 0.8)
-    end
-    
-    -- Set text
-    button:SetText(text)
-    local fontString = button:GetFontString()
-    fontString:SetTextColor(1, 1, 1, 1)
-    fontString:SetPoint("CENTER", 0, 0)
-    
-    -- Hover effect
-    button:SetScript("OnEnter", function(self)
-        self:SetBackdropColor(0, 0.7, 0.9, 0.3)  -- Cyan glow
-        if hasLightBorder then
-            self:SetBackdropBorderColor(0, 0.7, 0.9, 1)  -- Cyan border on hover
-        end
-        fontString:SetTextColor(0, 0.9, 1, 1)  -- Cyan text
-    end)
-    
-    button:SetScript("OnLeave", function(self)
-        self:SetBackdropColor(0.1, 0.1, 0.1, 0.8)
-        if hasLightBorder then
-            self:SetBackdropBorderColor(0.6, 0.6, 0.6, 1)  -- Back to light gray border
-        end
-        fontString:SetTextColor(1, 1, 1, 1)
-    end)
-    
-    -- Click effect
-    button:SetScript("OnMouseDown", function(self)
-        fontString:SetPoint("CENTER", 1, -1)
-    end)
-    
-    button:SetScript("OnMouseUp", function(self)
-        fontString:SetPoint("CENTER", 0, 0)
-    end)
-    
-    return button
-end
 
 -- Create ElvUI-style lock button with special locked state styling
 local function CreateElvUILockButton(parent, text, isLocked)
@@ -1482,7 +1615,7 @@ local function CreateOptionsGUI()
     
     -- Main frame
     optionsFrame = CreateFrame("Frame", "ManastormManagerOptionsFrame", UIParent)
-    optionsFrame:SetSize(400, 410)
+    optionsFrame:SetSize(400, 480)
     optionsFrame:SetPoint("CENTER")
     
     -- Apply ElvUI-style theming
@@ -1806,7 +1939,7 @@ local function CreateOptionsGUI()
     
     -- Sell All section (bottom right area)
     local sellAllLabel = optionsFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-    sellAllLabel:SetPoint("TOPRIGHT", -30, -210)
+    sellAllLabel:SetPoint("TOPRIGHT", -80, -240)
     sellAllLabel:SetText("Sell All:")
     if currentTheme == "elvui" then
         sellAllLabel:SetTextColor(1, 1, 1, 1)  -- White for ElvUI
@@ -1825,7 +1958,7 @@ local function CreateOptionsGUI()
     
     for _, rarity in ipairs(raritySettings) do
         local check = CreateFrame("CheckButton", nil, optionsFrame, "UICheckButtonTemplate")
-        check:SetPoint("TOPRIGHT", -120, -205 + rarity.yOffset)
+        check:SetPoint("TOPRIGHT", -120, -265 + rarity.yOffset)
         check:SetScript("OnClick", function()
             ManastormManagerDB[rarity.key] = check:GetChecked() and true or false
         end)
