@@ -3409,6 +3409,11 @@ frame:SetScript("OnEvent", function(self, event, ...)
             if elapsed >= 1.0 then  -- 1 second delay
                 autoOpenTimer:SetScript("OnUpdate", nil)
                 CheckAutoOpen()
+                
+                -- Adventure Mode: Check for duplicate hearthstones
+                if ManastormManagerDB.adventureMode then
+                    CleanupExtraHearthstones()
+                end
             end
         end)
         
