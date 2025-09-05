@@ -32,6 +32,16 @@ local autoOpenTimer = nil
 local lastCacheCount = 0
 local bagCheckTimer = nil
 
+-- NPC Detection variables
+local npcScanTimer = nil
+local lastNPCAlert = 0  -- Timestamp of last alert to prevent spam
+local alertCooldown = 30  -- Cooldown in seconds between alerts for same NPC
+local detectedNPCs = {}  -- Track detected NPCs with timestamps
+local detectedGUIDs = {}  -- Track specific NPC instances by GUID
+local flashFrame = nil  -- Frame for screen flash effect
+local toastFrame = nil  -- Frame for NPC toast notification
+local currentToastUnit = nil  -- Currently displayed NPC unit ID
+
 -- GUI variables
 local optionsFrame = nil
 local mainFrame = nil
@@ -44,7 +54,7 @@ local ShowProtectedItemsGUI
 local ShowAutoVendingGUI
 
 -- Default settings
-ManastormManagerDB = ManastormManagerDB or {
+local defaultSettings = {
     delay = 0.7,  -- Delay between opening caches (seconds) - enough time for loot window
     verbose = false,  -- Show detailed messages
     vendorDelay = 0.2,  -- Delay between vendoring items (seconds)
@@ -64,8 +74,31 @@ ManastormManagerDB = ManastormManagerDB or {
     dockPoint = "CENTER",  -- Dock anchor point
     dockRelativePoint = "CENTER",  -- Dock relative anchor point
     dockX = 200,  -- Dock X offset
-    dockY = 200  -- Dock Y offset
+    dockY = 200,  -- Dock Y offset
+    -- NPC Detection settings
+    npcDetection = true,  -- Enable NPC detection for rare spawns
+    npcScanInterval = 2.0,  -- Scan interval in seconds
+    npcAlertSound = true,  -- Play alert sound when NPC found
+    npcFlashScreen = true,  -- Flash screen edges when NPC found
+    npcMarkTarget = true,  -- Place raid target marker on detected NPC
+    npcLightMode = true  -- Use light scanning mode for better performance
 }
+
+-- Initialize settings with defaults
+local function InitializeSettings()
+    ManastormManagerDB = ManastormManagerDB or {}
+    
+    -- Add any missing settings from defaults
+    for key, value in pairs(defaultSettings) do
+        if ManastormManagerDB[key] == nil then
+            ManastormManagerDB[key] = value
+        end
+    end
+    
+    -- Special handling for tables to preserve existing data
+    ManastormManagerDB.protectedItems = ManastormManagerDB.protectedItems or {}
+    ManastormManagerDB.autoSellItems = ManastormManagerDB.autoSellItems or {}
+end
 
 -- Print function with addon prefix
 local function Print(msg)
@@ -268,6 +301,466 @@ local function CleanupExtraHearthstones()
     end
 end
 
+-- NPC Detection Functions
+
+-- Create screen flash effect
+local function CreateFlashEffect()
+    if flashFrame then
+        return flashFrame
+    end
+    
+    flashFrame = CreateFrame("Frame", "ManastormFlashFrame", UIParent)
+    flashFrame:SetAllPoints()
+    flashFrame:SetFrameStrata("FULLSCREEN_DIALOG")
+    flashFrame:Hide()
+    
+    -- Create border textures for flashing effect
+    local borders = {}
+    local borderSize = 8
+    
+    -- Top border
+    borders.top = flashFrame:CreateTexture(nil, "OVERLAY")
+    borders.top:SetTexture(1, 1, 0, 0.7)  -- Yellow with transparency
+    borders.top:SetPoint("TOPLEFT", flashFrame, "TOPLEFT")
+    borders.top:SetPoint("TOPRIGHT", flashFrame, "TOPRIGHT")
+    borders.top:SetHeight(borderSize)
+    
+    -- Bottom border  
+    borders.bottom = flashFrame:CreateTexture(nil, "OVERLAY")
+    borders.bottom:SetTexture(1, 1, 0, 0.7)
+    borders.bottom:SetPoint("BOTTOMLEFT", flashFrame, "BOTTOMLEFT")
+    borders.bottom:SetPoint("BOTTOMRIGHT", flashFrame, "BOTTOMRIGHT")
+    borders.bottom:SetHeight(borderSize)
+    
+    -- Left border
+    borders.left = flashFrame:CreateTexture(nil, "OVERLAY")
+    borders.left:SetTexture(1, 1, 0, 0.7)
+    borders.left:SetPoint("TOPLEFT", flashFrame, "TOPLEFT")
+    borders.left:SetPoint("BOTTOMLEFT", flashFrame, "BOTTOMLEFT")
+    borders.left:SetWidth(borderSize)
+    
+    -- Right border
+    borders.right = flashFrame:CreateTexture(nil, "OVERLAY")
+    borders.right:SetTexture(1, 1, 0, 0.7)
+    borders.right:SetPoint("TOPRIGHT", flashFrame, "TOPRIGHT")
+    borders.right:SetPoint("BOTTOMRIGHT", flashFrame, "BOTTOMRIGHT")
+    borders.right:SetWidth(borderSize)
+    
+    flashFrame.borders = borders
+    return flashFrame
+end
+
+-- Flash the screen edges
+local function FlashScreen()
+    if not ManastormManagerDB or not ManastormManagerDB.npcFlashScreen then
+        return
+    end
+    
+    local frame = CreateFlashEffect()
+    frame:Show()
+    
+    -- Animate the flash
+    local elapsed = 0
+    local duration = 0.8
+    local pulses = 3
+    
+    frame:SetScript("OnUpdate", function(self, dt)
+        elapsed = elapsed + dt
+        local progress = elapsed / duration
+        
+        if progress >= 1 then
+            self:Hide()
+            self:SetScript("OnUpdate", nil)
+            return
+        end
+        
+        -- Calculate alpha for pulsing effect
+        local pulseProgress = (progress * pulses) % 1
+        local alpha = 0.7 * (1 - pulseProgress)
+        
+        -- Update all border alphas
+        for _, border in pairs(self.borders) do
+            border:SetTexture(1, 1, 0, alpha)
+        end
+    end)
+end
+
+-- Play alert sound
+local function PlayAlertSound()
+    if not ManastormManagerDB or not ManastormManagerDB.npcAlertSound then
+        return
+    end
+    
+    -- Play a notification sound - using RaidWarning sound
+    PlaySound("RaidWarning")
+end
+
+-- Create NPC toast notification
+local function CreateToastNotification()
+    if toastFrame then
+        return toastFrame
+    end
+    
+    toastFrame = CreateFrame("Frame", "ManastormNPCToast", UIParent)
+    toastFrame:SetSize(220, 140)
+    
+    -- Load saved position or use default
+    if ManastormManagerDB.toastPoint then
+        toastFrame:SetPoint(
+            ManastormManagerDB.toastPoint,
+            UIParent,
+            ManastormManagerDB.toastRelativePoint or "CENTER",
+            ManastormManagerDB.toastX or 0,
+            ManastormManagerDB.toastY or 0
+        )
+    else
+        -- Default position above dock
+        toastFrame:SetPoint("BOTTOM", dockFrame, "TOP", 0, 10)
+    end
+    
+    toastFrame:SetFrameStrata("HIGH")
+    toastFrame:EnableMouse(true)
+    toastFrame:SetMovable(true)
+    toastFrame:RegisterForDrag("LeftButton")
+    toastFrame:Hide()
+    
+    -- Drag functionality
+    toastFrame:SetScript("OnDragStart", function(self)
+        if not IsShiftKeyDown() then
+            return  -- Only allow dragging with Shift held
+        end
+        self:StartMoving()
+    end)
+    
+    toastFrame:SetScript("OnDragStop", function(self)
+        self:StopMovingOrSizing()
+        -- Save the position
+        local point, _, relativePoint, x, y = self:GetPoint()
+        ManastormManagerDB.toastPoint = point
+        ManastormManagerDB.toastRelativePoint = relativePoint
+        ManastormManagerDB.toastX = x
+        ManastormManagerDB.toastY = y
+        Print("Toast position saved! Future notifications will appear here.")
+    end)
+    
+    -- Background
+    local bg = toastFrame:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints()
+    bg:SetTexture(0, 0, 0, 0.8)
+    
+    -- Border
+    local border = CreateFrame("Frame", nil, toastFrame)
+    border:SetAllPoints()
+    border:SetBackdrop({
+        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+        edgeSize = 12,
+        insets = {left = 2, right = 2, top = 2, bottom = 2}
+    })
+    border:SetBackdropBorderColor(1, 0.8, 0, 1) -- Gold border
+    
+    -- Title
+    local title = toastFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    title:SetPoint("TOP", 0, -8)
+    title:SetTextColor(1, 0, 0, 1) -- Red
+    title:SetText("RARE SPAWN!")
+    toastFrame.title = title
+    
+    -- NPC Name
+    local npcName = toastFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    npcName:SetPoint("TOP", title, "BOTTOM", 0, -4)
+    npcName:SetTextColor(1, 1, 0, 1) -- Yellow
+    npcName:SetText("")
+    toastFrame.npcName = npcName
+    
+    -- 3D Model Frame
+    local modelFrame = CreateFrame("PlayerModel", nil, toastFrame)
+    modelFrame:SetSize(80, 80)
+    modelFrame:SetPoint("LEFT", 10, -10)
+    modelFrame:SetCamera(0)
+    toastFrame.modelFrame = modelFrame
+    
+    -- Click to target button using SecureActionButton to avoid taint
+    local targetButton = CreateFrame("Button", nil, toastFrame, "SecureActionButtonTemplate")
+    targetButton:SetAllPoints(modelFrame)
+    targetButton:SetAttribute("type", "macro")
+    -- We'll set the macro text when we show the toast
+    toastFrame.targetButton = targetButton
+    
+    -- Close button
+    local closeButton = CreateFrame("Button", nil, toastFrame)
+    closeButton:SetSize(16, 16)
+    closeButton:SetPoint("TOPRIGHT", -4, -4)
+    closeButton:SetNormalTexture("Interface\\Buttons\\UI-Panel-MinimizeButton-Up")
+    closeButton:SetPushedTexture("Interface\\Buttons\\UI-Panel-MinimizeButton-Down")
+    closeButton:SetHighlightTexture("Interface\\Buttons\\UI-Panel-MinimizeButton-Highlight")
+    closeButton:SetScript("OnClick", function()
+        toastFrame:Hide()
+        currentToastUnit = nil
+    end)
+    toastFrame.closeButton = closeButton
+    
+    -- Instructions text
+    local instructions = toastFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    instructions:SetPoint("BOTTOMLEFT", 10, 8)
+    instructions:SetPoint("BOTTOMRIGHT", -30, 8)
+    instructions:SetHeight(30)
+    instructions:SetJustifyH("LEFT")
+    instructions:SetTextColor(0.8, 0.8, 0.8, 1)
+    instructions:SetText("Click model to target\nShift+Drag to move • X to close")
+    toastFrame.instructions = instructions
+    
+    -- Auto-hide timer
+    local autoHideTimer = nil
+    toastFrame.StartAutoHide = function(self, duration)
+        if autoHideTimer then
+            autoHideTimer:SetScript("OnUpdate", nil)
+        end
+        
+        autoHideTimer = CreateFrame("Frame")
+        local elapsed = 0
+        autoHideTimer:SetScript("OnUpdate", function(timer, dt)
+            elapsed = elapsed + dt
+            if elapsed >= (duration or 10) then
+                timer:SetScript("OnUpdate", nil)
+                self:Hide()
+                currentToastUnit = nil
+            end
+        end)
+    end
+    
+    return toastFrame
+end
+
+-- Show toast notification for detected NPC
+local function ShowNPCToast(unitId, npcName)
+    if not ManastormManagerDB or not ManastormManagerDB.npcDetection then
+        return
+    end
+    
+    local toast = CreateToastNotification()
+    currentToastUnit = unitId
+    
+    -- Set NPC name
+    toast.npcName:SetText(npcName)
+    
+    -- Try to set the model - this might not work perfectly in 3.3.5a
+    if toast.modelFrame and UnitExists(unitId) then
+        -- Method 1: Try to set model from unit
+        toast.modelFrame:SetUnit(unitId)
+        
+        -- Method 2: Fallback - try to set by creature display ID (if available)
+        -- This would need specific display IDs for each NPC, which we don't have
+        -- So we'll rely on SetUnit working
+        
+        -- Set camera position
+        toast.modelFrame:SetCamera(0)
+        toast.modelFrame:SetPosition(0, 0, 0)
+        toast.modelFrame:SetFacing(0)
+    end
+    
+    -- Set up the secure targeting macro for the button
+    if toast.targetButton then
+        -- Use /targetexact to avoid partial name matches
+        local macroText = "/targetexact " .. npcName
+        toast.targetButton:SetAttribute("macrotext", macroText)
+    end
+    
+    -- Show the toast
+    toast:Show()
+    
+    -- Auto-hide after 15 seconds
+    toast:StartAutoHide(15)
+    
+    DebugPrint("Showing toast notification for: " .. npcName)
+end
+
+-- Mark target with raid icon
+local function MarkNPCTarget(unitId)
+    if not ManastormManagerDB or not ManastormManagerDB.npcMarkTarget or not unitId then
+        return
+    end
+    
+    -- Check if target already has a raid icon
+    local existingMark = GetRaidTargetIndex(unitId)
+    if existingMark and existingMark > 0 then
+        DebugPrint("Target already has raid mark " .. existingMark .. ", not overriding")
+        return
+    end
+    
+    -- Set raid target icon 7 (cross/X) on the NPC
+    -- Only works if player has raid/party lead or assist
+    SetRaidTarget(unitId, 7)
+    DebugPrint("Marked target with cross (7) raid icon")
+end
+
+-- Scan for target NPCs
+local function ScanForTargetNPCs()
+    if not ManastormManagerDB or not ManastormManagerDB.npcDetection then
+        return
+    end
+    
+    local currentTime = GetTime()
+    local targetNPCs = {
+        "Clepto the Cardnapper",
+        "Greedy Demon"
+    }
+    
+    -- Helper function to check and alert for target NPC
+    local function CheckUnit(unitId, unitName)
+        if not unitName then return end
+        
+        -- Get unit GUID for tracking specific instances
+        local unitGUID = UnitGUID(unitId)
+        
+        -- Check if unit is dead
+        if UnitIsDead(unitId) then
+            -- If this specific NPC instance was tracked, remove it
+            if unitGUID and detectedGUIDs[unitGUID] then
+                DebugPrint("Detected NPC with GUID " .. unitGUID .. " is dead, removing from tracking")
+                detectedGUIDs[unitGUID] = nil
+            end
+            -- Also clear the name-based cooldown for this NPC type
+            for _, targetName in ipairs(targetNPCs) do
+                if unitName == targetName and detectedNPCs[targetName] then
+                    DebugPrint("Detected NPC " .. targetName .. " is dead, clearing cooldown")
+                    detectedNPCs[targetName] = nil  -- Clear cooldown so new spawns are detected immediately
+                end
+            end
+            return false
+        end
+        
+        -- Check if unit is attackable (not already tapped by another player)
+        if not UnitCanAttack("player", unitId) then
+            DebugPrint("Unit " .. unitName .. " cannot be attacked, skipping")
+            return false
+        end
+        
+        for _, targetName in ipairs(targetNPCs) do
+            if unitName == targetName then
+                -- Check if we've already alerted for this specific NPC instance
+                if unitGUID and detectedGUIDs[unitGUID] then
+                    -- We've already alerted for this specific NPC
+                    return false
+                end
+                
+                -- This is a new instance of the NPC (different GUID or no GUID available)
+                -- Mark this specific instance as detected
+                if unitGUID then
+                    detectedGUIDs[unitGUID] = currentTime
+                end
+                
+                -- Also track by name for fallback (in case GUID isn't available)
+                detectedNPCs[targetName] = currentTime
+                
+                -- Alert the player
+                Print("|cffff0000RARE SPAWN DETECTED:|r |cffffee00" .. targetName .. "|r has been found!")
+                Print("The magnificent Millhouse has marked this creature for your convenience!")
+                
+                -- Flash screen
+                FlashScreen()
+                
+                -- Play sound
+                PlayAlertSound()
+                
+                -- Show toast notification with NPC model
+                ShowNPCToast(unitId, targetName)
+                
+                -- Mark with raid target (only if not already marked)
+                MarkNPCTarget(unitId)
+                
+                DebugPrint("Detected and marked: " .. targetName .. " (unit: " .. unitId .. ", GUID: " .. (unitGUID or "unknown") .. ")")
+                return true
+            end
+        end
+        return false
+    end
+    
+    -- Check target
+    if UnitExists("target") then
+        local targetName = UnitName("target")
+        CheckUnit("target", targetName)
+    end
+    
+    -- Check mouseover
+    if UnitExists("mouseover") then
+        local mouseoverName = UnitName("mouseover")
+        CheckUnit("mouseover", mouseoverName)
+    end
+    
+    -- Check party/raid targets
+    if GetNumPartyMembers() > 0 then
+        for i = 1, GetNumPartyMembers() do
+            local unitId = "party" .. i .. "target"
+            if UnitExists(unitId) then
+                local unitName = UnitName(unitId)
+                CheckUnit(unitId, unitName)
+            end
+        end
+    end
+    
+    -- Check raid targets if in raid
+    if GetNumRaidMembers() > 0 then
+        for i = 1, GetNumRaidMembers() do
+            local unitId = "raid" .. i .. "target"
+            if UnitExists(unitId) then
+                local unitName = UnitName(unitId)
+                CheckUnit(unitId, unitName)
+            end
+        end
+    end
+    
+    -- Try to scan nameplates
+    for i = 1, 40 do
+        local unitId = "nameplate" .. i
+        if UnitExists(unitId) then
+            local unitName = UnitName(unitId)
+            CheckUnit(unitId, unitName)
+        end
+    end
+end
+
+-- Start NPC detection timer
+local function StartNPCDetection()
+    -- Ensure settings are initialized
+    if not ManastormManagerDB then
+        InitializeSettings()
+    end
+    
+    if not ManastormManagerDB.npcDetection then
+        StopNPCDetection()
+        return
+    end
+    
+    if npcScanTimer then
+        return  -- Already running
+    end
+    
+    -- Default scan interval if not set
+    local scanInterval = ManastormManagerDB.npcScanInterval or 2.0
+    
+    npcScanTimer = CreateFrame("Frame")
+    local elapsed = 0
+    
+    npcScanTimer:SetScript("OnUpdate", function(self, dt)
+        elapsed = elapsed + dt
+        if elapsed >= scanInterval then
+            elapsed = 0
+            ScanForTargetNPCs()
+        end
+    end)
+    
+    DebugPrint("NPC Detection started (scan interval: " .. scanInterval .. "s)")
+end
+
+-- Stop NPC detection timer
+local function StopNPCDetection()
+    if npcScanTimer then
+        npcScanTimer:SetScript("OnUpdate", nil)
+        npcScanTimer = nil
+        DebugPrint("NPC Detection stopped")
+    end
+end
+
 -- Open a single cache
 local function OpenCache(bag, slot, isAutoOpen)
     -- Get item info before opening
@@ -295,6 +788,23 @@ local function OpenCache(bag, slot, isAutoOpen)
     -- No more chat spam - completion message is handled in ProcessQueue
 end
 
+-- Count empty bag slots
+local function GetEmptyBagSlots()
+    local emptySlots = 0
+    for bag = 0, 4 do
+        local numSlots = GetContainerNumSlots(bag)
+        if numSlots and numSlots > 0 then
+            for slot = 1, numSlots do
+                local texture = GetContainerItemInfo(bag, slot)
+                if not texture then
+                    emptySlots = emptySlots + 1
+                end
+            end
+        end
+    end
+    return emptySlots
+end
+
 -- Process the opening queue
 local function ProcessQueue(isAutoOpen)
     if not isOpening then
@@ -310,6 +820,16 @@ local function ProcessQueue(isAutoOpen)
     isProcessingQueue = true
     local queueSize = table.getn(openQueue)
     DebugPrint("ProcessQueue: Queue has " .. queueSize .. " items")
+    
+    -- Check bag space before continuing
+    local emptySlots = GetEmptyBagSlots()
+    if emptySlots <= 1 then
+        Print("|cffff0000Stopping cache opening - bags are full! (" .. emptySlots .. " slots remaining)|r")
+        Print("|cffffee00Clear some bag space and use /ms open to continue.|r")
+        isProcessingQueue = false  -- Clear this before StopOpening
+        StopOpening()
+        return
+    end
     
     -- Get next cache from queue
     if queueSize > 0 then
@@ -346,9 +866,21 @@ local function ProcessQueue(isAutoOpen)
                     end
                 end)
             elseif locked then
-                -- If locked, put it back at the end of the queue and continue with next
-                DebugPrint("Cache is locked, requeueing and continuing")
-                table.insert(openQueue, cache)
+                -- Check if we've tried too many times (level-restricted caches)
+                cache.retries = (cache.retries or 0) + 1
+                
+                if cache.retries >= 3 then
+                    -- Skip this cache after 3 failed attempts
+                    local itemLink = GetContainerItemLink(cache.bag, cache.slot)
+                    local itemName = itemLink and GetItemInfo(itemLink) or "Unknown Cache"
+                    Print("|cffff0000Cannot open " .. itemName .. " - may require level 70. Skipping after 3 attempts.|r")
+                    DebugPrint("Cache at bag " .. cache.bag .. " slot " .. cache.slot .. " failed 3 times, skipping")
+                else
+                    -- If locked, put it back at the end of the queue and continue with next
+                    DebugPrint("Cache is locked (attempt " .. cache.retries .. "), requeueing and continuing")
+                    table.insert(openQueue, cache)
+                end
+                
                 -- Process next with a small delay to avoid freezing
                 local timer = CreateFrame("Frame")
                 local elapsed = 0
@@ -402,7 +934,7 @@ local function ProcessQueue(isAutoOpen)
             DebugPrint("Found " .. table.getn(caches) .. " caches (including locked), adding to queue")
             
             for i, cache in ipairs(caches) do
-                table.insert(openQueue, {bag = cache.bag, slot = cache.slot})
+                table.insert(openQueue, {bag = cache.bag, slot = cache.slot, retries = 0})
             end
             
             -- Continue processing with small delay to avoid freezing
@@ -470,6 +1002,7 @@ local function OpenManastormCaches(isAutoOpen, isRestart)
             Print("Restarting cache opening process...")
             -- Stop the current process
             isOpening = false
+            isProcessingQueue = false  -- Clear this flag too
             openQueue = {}
             currentlyOpening = 0
             totalCaches = 0
@@ -516,8 +1049,8 @@ local function OpenManastormCaches(isAutoOpen, isRestart)
     totalCaches = 0
     
     for i, cache in ipairs(caches) do
-        -- Add one entry per cache (caches don't stack)
-        table.insert(openQueue, {bag = cache.bag, slot = cache.slot})
+        -- Add one entry per cache (caches don't stack) with retry counter
+        table.insert(openQueue, {bag = cache.bag, slot = cache.slot, retries = 0})
         totalCaches = totalCaches + cache.count
     end
     
@@ -2803,6 +3336,150 @@ local function CreateMainDock()
         end)
     end
     
+    -- NPC scan toggle button - small 'N' on the left side
+    local npcButton
+    if theme == "elvui" then
+        -- Create ElvUI-style NPC button with state styling
+        npcButton = CreateFrame("Button", nil, dockFrame)
+        npcButton:SetNormalFontObject("GameFontNormal")
+        npcButton:SetHighlightFontObject("GameFontHighlight")
+        npcButton:SetSize(18, 18)
+        npcButton:SetPoint("TOPLEFT", 4, -4)
+        
+        -- Create backdrop
+        npcButton:SetBackdrop({
+            bgFile = "Interface\\Buttons\\WHITE8X8",
+            edgeFile = "Interface\\Buttons\\WHITE8X8",
+            tile = false, tileSize = 0, edgeSize = 1,
+            insets = { left = 0, right = 0, top = 0, bottom = 0 }
+        })
+        
+        npcButton:SetText("N")
+        local fontString = npcButton:GetFontString()
+        fontString:SetPoint("CENTER", 0, 0)
+        
+        -- Function to update button appearance based on NPC detection state
+        local function UpdateNPCDetectionState()
+            local enabled = ManastormManagerDB.npcDetection
+            if enabled then
+                -- Enabled state: white background, black text, light gray border
+                npcButton:SetBackdropColor(1, 1, 1, 0.9)  -- White background
+                npcButton:SetBackdropBorderColor(0.6, 0.6, 0.6, 1)  -- Light gray border
+                fontString:SetTextColor(0, 0, 0, 1)  -- Black text
+            else
+                -- Disabled state: dark background, white text, light gray border
+                npcButton:SetBackdropColor(0.1, 0.1, 0.1, 0.8)  -- Dark background
+                npcButton:SetBackdropBorderColor(0.6, 0.6, 0.6, 1)  -- Light gray border
+                fontString:SetTextColor(1, 1, 1, 1)  -- White text
+            end
+        end
+        
+        -- Store the update function so we can call it externally
+        npcButton.UpdateNPCDetectionState = UpdateNPCDetectionState
+        
+        -- Initial state
+        UpdateNPCDetectionState()
+        
+        -- Hover effect
+        npcButton:SetScript("OnEnter", function(self)
+            local enabled = ManastormManagerDB.npcDetection
+            if enabled then
+                -- When enabled, hover gives a subtle cyan tint to white background
+                self:SetBackdropColor(0.9, 0.95, 1, 0.9)
+            else
+                -- When disabled, hover gives a subtle highlight to dark background
+                self:SetBackdropColor(0.2, 0.2, 0.2, 0.9)
+            end
+        end)
+        
+        npcButton:SetScript("OnLeave", function(self)
+            -- Restore original state
+            UpdateNPCDetectionState()
+        end)
+    else
+        npcButton = CreateFrame("Button", nil, dockFrame, "UIPanelButtonTemplate")
+        npcButton:SetSize(20, 20)
+        npcButton:SetPoint("TOPLEFT", 8, -8)
+        npcButton:SetText("N")
+        
+        -- Set initial color based on detection state
+        npcButton:SetNormalFontObject("GameFontNormalSmall")
+        local fontString = npcButton:GetFontString()
+        if fontString then
+            if ManastormManagerDB.npcDetection then
+                fontString:SetTextColor(0, 1, 0, 1)  -- Green when enabled
+            else
+                fontString:SetTextColor(1, 0.82, 0, 1)  -- Yellow/gold when disabled
+            end
+        end
+    end
+    
+    -- Store reference for updating
+    dockFrame.npcButton = npcButton
+    
+    -- NPC button functionality
+    npcButton:SetScript("OnClick", function(self)
+        ManastormManagerDB.npcDetection = not ManastormManagerDB.npcDetection
+        
+        local currentTheme = ManastormManagerDB.dockTheme or "blizzard"
+        
+        if ManastormManagerDB.npcDetection then
+            StartNPCDetection()
+            Print("NPC Detection |cff00ff00ENABLED|r! My arcane senses are now scanning for rare spawns!")
+            
+            -- Update button appearance based on theme
+            if currentTheme == "elvui" then
+                -- Use the new state update function
+                if self.UpdateNPCDetectionState then
+                    self.UpdateNPCDetectionState()
+                end
+            else
+                -- For Blizzard theme, update text color to green
+                self:SetNormalFontObject("GameFontNormalSmall")
+                local fontString = self:GetFontString()
+                if fontString then
+                    fontString:SetTextColor(0, 1, 0, 1)  -- Green
+                end
+            end
+        else
+            StopNPCDetection()
+            Print("NPC Detection |cffff0000DISABLED|r. My magical surveillance has been suspended.")
+            
+            -- Update button appearance based on theme
+            if currentTheme == "elvui" then
+                -- Use the new state update function
+                if self.UpdateNPCDetectionState then
+                    self.UpdateNPCDetectionState()
+                end
+            else
+                -- For Blizzard theme, update text color to yellow/gold
+                self:SetNormalFontObject("GameFontNormalSmall")
+                local fontString = self:GetFontString()
+                if fontString then
+                    fontString:SetTextColor(1, 0.82, 0, 1)  -- Yellow/gold when disabled
+                end
+            end
+        end
+    end)
+    
+    -- Add tooltip to NPC button
+    npcButton:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        if ManastormManagerDB.npcDetection then
+            GameTooltip:SetText("NPC Detection: ON", 0, 1, 0)
+            GameTooltip:AddLine("Click to disable rare spawn detection", 1, 1, 1)
+        else
+            GameTooltip:SetText("NPC Detection: OFF", 1, 0, 0)
+            GameTooltip:AddLine("Click to enable rare spawn detection", 1, 1, 1)
+        end
+        GameTooltip:AddLine("Scans for: Clepto the Cardnapper & Greedy Demon", 0.8, 0.8, 0.8)
+        GameTooltip:Show()
+    end)
+    
+    npcButton:SetScript("OnLeave", function()
+        GameTooltip:Hide()
+    end)
+    
     -- Lock button - small 'L' next to Options button
     local lockButton
     if theme == "elvui" then
@@ -2814,10 +3491,21 @@ local function CreateMainDock()
         lockButton:SetSize(20, 20)
         lockButton:SetPoint("TOPRIGHT", -30, -8)  -- 22px to the left of Options button
         lockButton:SetText("L")
+        
+        -- Set initial color based on lock state
+        lockButton:SetNormalFontObject("GameFontNormalSmall")
+        local fontString = lockButton:GetFontString()
+        if fontString then
+            if ManastormManagerDB.dockLocked then
+                fontString:SetTextColor(0, 1, 0, 1)  -- Green when locked
+            else
+                fontString:SetTextColor(1, 0.82, 0, 1)  -- Yellow/gold when unlocked
+            end
+        end
     end
     
     -- Lock button functionality
-    lockButton:SetScript("OnClick", function()
+    lockButton:SetScript("OnClick", function(self)
         -- Save current position before toggling lock
         SaveDockPosition()
         
@@ -2838,9 +3526,23 @@ local function CreateMainDock()
             end
         end
         
-        -- Update button appearance for ElvUI theme
-        if theme == "elvui" and lockButton.UpdateLockState then
-            lockButton.UpdateLockState()
+        -- Update button appearance based on theme
+        local currentTheme = ManastormManagerDB.dockTheme or "blizzard"
+        if currentTheme == "elvui" then
+            if self.UpdateLockState then
+                self.UpdateLockState()
+            end
+        else
+            -- For Blizzard theme, update text color
+            self:SetNormalFontObject("GameFontNormalSmall")
+            local fontString = self:GetFontString()
+            if fontString then
+                if ManastormManagerDB.dockLocked then
+                    fontString:SetTextColor(0, 1, 0, 1)  -- Green when locked
+                else
+                    fontString:SetTextColor(1, 0.82, 0, 1)  -- Yellow/gold when unlocked
+                end
+            end
         end
     end)
     
@@ -2883,7 +3585,7 @@ local function CreateMainDock()
         autoOpenButton:SetNormalFontObject("GameFontNormal")
         autoOpenButton:SetHighlightFontObject("GameFontHighlight")
         autoOpenButton:SetSize(18, 18)
-        autoOpenButton:SetPoint("TOPLEFT", 4, -4)
+        autoOpenButton:SetPoint("TOPLEFT", 26, -4)  -- 22px to the right of N button
         
         -- Create backdrop
         autoOpenButton:SetBackdrop({
@@ -2949,12 +3651,23 @@ local function CreateMainDock()
     else
         autoOpenButton = CreateFrame("Button", nil, dockFrame, "UIPanelButtonTemplate")
         autoOpenButton:SetSize(20, 20)
-        autoOpenButton:SetPoint("TOPLEFT", 8, -8)
+        autoOpenButton:SetPoint("TOPLEFT", 30, -8)  -- 22px to the right of N button
         autoOpenButton:SetText("A")
+        
+        -- Set initial color based on auto-open state
+        autoOpenButton:SetNormalFontObject("GameFontNormalSmall")
+        local fontString = autoOpenButton:GetFontString()
+        if fontString then
+            if ManastormManagerDB.autoOpen then
+                fontString:SetTextColor(0, 1, 0, 1)  -- Green when enabled
+            else
+                fontString:SetTextColor(1, 0.82, 0, 1)  -- Yellow/gold when disabled
+            end
+        end
     end
     
     -- Auto-Open button functionality
-    autoOpenButton:SetScript("OnClick", function()
+    autoOpenButton:SetScript("OnClick", function(self)
         ManastormManagerDB.autoOpen = not ManastormManagerDB.autoOpen
         
         if ManastormManagerDB.verbose then
@@ -2967,9 +3680,23 @@ local function CreateMainDock()
             lastCacheCount = totalCount or 0
         end
         
-        -- Update button appearance for ElvUI theme
-        if theme == "elvui" and autoOpenButton.UpdateAutoOpenState then
-            autoOpenButton.UpdateAutoOpenState()
+        -- Update button appearance based on theme
+        local currentTheme = ManastormManagerDB.dockTheme or "blizzard"
+        if currentTheme == "elvui" then
+            if self.UpdateAutoOpenState then
+                self.UpdateAutoOpenState()
+            end
+        else
+            -- For Blizzard theme, update text color
+            self:SetNormalFontObject("GameFontNormalSmall")
+            local fontString = self:GetFontString()
+            if fontString then
+                if ManastormManagerDB.autoOpen then
+                    fontString:SetTextColor(0, 1, 0, 1)  -- Green when enabled
+                else
+                    fontString:SetTextColor(1, 0.82, 0, 1)  -- Yellow/gold when disabled
+                end
+            end
         end
     end)
     
@@ -3058,6 +3785,13 @@ end
 -- Check for new caches and auto-open if enabled
 local function CheckAutoOpen()
     if ManastormManagerDB.autoOpen and not isOpening and not InCombatLockdown() then
+        -- Check bag space before auto-opening
+        local emptySlots = GetEmptyBagSlots()
+        if emptySlots <= 1 then
+            DebugPrint("Auto-open skipped: Only " .. emptySlots .. " empty bag slots remaining")
+            return
+        end
+        
         local caches, currentCacheCount = FindManastormCaches()
         currentCacheCount = currentCacheCount or 0
         
@@ -3124,12 +3858,25 @@ local function SlashCommandHandler(msg)
         print("  |cffff9933/ms exportprotected|r - Export protected items list")
         print("  |cffff9933/ms exportautosell|r - Export auto-sell items list")
         print("  |cffff9933/ms import <string>|r - Import items list from string")
+        print("  |cffff9933/ms npc|r - Check NPC detection status")
+        print("  |cffff9933/ms npc on|r - Enable NPC detection for rare spawns")
+        print("  |cffff9933/ms npc off|r - Disable NPC detection")
+        print("  |cffff9933/ms npc test|r - Test the NPC alert system")
+        print("  |cffff9933/ms npc clear|r - Clear NPC detection memory")
+        print("  |cffff9933/ms toast reset|r - Reset toast notification position")
     elseif command == "config" then
         Print("Configuration:")
         print("  Delay between opens: |cffff9933" .. ManastormManagerDB.delay .. "s|r")
         print("  Vendor delay: |cffff9933" .. ManastormManagerDB.vendorDelay .. "s|r")
         print("  Auto-open new caches: |cffff9933" .. (ManastormManagerDB.autoOpen and "ON" or "OFF") .. "|r")
         print("  Verbose logging: |cffff9933" .. (ManastormManagerDB.verbose and "ON" or "OFF") .. "|r")
+        print("  NPC Detection: |cffff9933" .. (ManastormManagerDB.npcDetection and "ON" or "OFF") .. "|r")
+        if ManastormManagerDB.npcDetection then
+            print("    Scan interval: |cffff9933" .. ManastormManagerDB.npcScanInterval .. "s|r")
+            print("    Alert sound: |cffff9933" .. (ManastormManagerDB.npcAlertSound and "ON" or "OFF") .. "|r")
+            print("    Flash screen: |cffff9933" .. (ManastormManagerDB.npcFlashScreen and "ON" or "OFF") .. "|r")
+            print("    Mark targets: |cffff9933" .. (ManastormManagerDB.npcMarkTarget and "ON" or "OFF") .. "|r")
+        end
         print("  Sell gear rarities:")
         print("    Trash (gray): |cffff9933" .. (ManastormManagerDB.sellTrash ~= false and "YES" or "NO") .. "|r")
         print("    Common (white): |cffff9933" .. (ManastormManagerDB.sellCommon ~= false and "YES" or "NO") .. "|r")
@@ -3317,6 +4064,74 @@ local function SlashCommandHandler(msg)
         else
             Print("Unknown theme! Use 'blizzard' or 'elvui'. Even my incredible intellect has limits!")
         end
+    elseif command == "npc" or command == "scan" then
+        if ManastormManagerDB.npcDetection then
+            Print("NPC Detection is |cff00ff00ENABLED|r. I am vigilantly watching for Clepto the Cardnapper and Greedy Demon!")
+        else
+            Print("NPC Detection is |cffff0000DISABLED|r. Use |cffff9933/ms npc on|r to enable my watchful eye!")
+        end
+    elseif command == "npc on" or command == "scan on" then
+        ManastormManagerDB.npcDetection = true
+        StartNPCDetection()
+        Print("NPC Detection |cff00ff00ENABLED|r! My arcane senses are now attuned to detect those elusive creatures!")
+        Print("I will alert you when Clepto the Cardnapper or Greedy Demon are spotted!")
+    elseif command == "npc off" or command == "scan off" then
+        ManastormManagerDB.npcDetection = false
+        StopNPCDetection()
+        Print("NPC Detection |cffff0000DISABLED|r. My magical surveillance has been suspended.")
+    elseif command == "npc test" then
+        Print("Testing NPC alert system...")
+        Print("|cffff0000RARE SPAWN DETECTED:|r |cffffee00Test NPC|r has been found!")
+        Print("The magnificent Millhouse has marked this creature for your convenience!")
+        FlashScreen()
+        PlayAlertSound()
+        
+        -- Force show toast for testing (bypass detection check)
+        Print("Creating toast notification...")
+        local toast = CreateToastNotification()
+        if not toast then
+            Print("ERROR: Failed to create toast!")
+            return
+        end
+        
+        Print("Setting up toast...")
+        currentToastUnit = "player"
+        toast.npcName:SetText("Test NPC")
+        
+        -- Try to set the model using player
+        if toast.modelFrame and UnitExists("player") then
+            Print("Setting player model...")
+            toast.modelFrame:SetUnit("player")
+            toast.modelFrame:SetCamera(0)
+            toast.modelFrame:SetPosition(0, 0, 0)
+            toast.modelFrame:SetFacing(0)
+        else
+            Print("WARNING: Model frame or player not found!")
+        end
+        
+        -- Set up the secure targeting macro for the test
+        if toast.targetButton then
+            -- For test, target the player
+            toast.targetButton:SetAttribute("macrotext", "/target player")
+        end
+        
+        -- Show the toast
+        Print("Showing toast...")
+        toast:Show()
+        toast:StartAutoHide(15)
+        
+        Print("Alert test complete! Toast should appear above the dock.")
+    elseif command == "npc clear" or command == "npc reset" then
+        detectedNPCs = {}
+        detectedGUIDs = {}
+        Print("My memory of previously detected NPCs has been wiped clean! I shall alert you anew when they appear!")
+    elseif command == "toast reset" then
+        -- Reset toast position
+        ManastormManagerDB.toastPoint = nil
+        ManastormManagerDB.toastRelativePoint = nil
+        ManastormManagerDB.toastX = nil
+        ManastormManagerDB.toastY = nil
+        Print("Toast position reset! Next toast will appear above the dock.")
     else
         Print("Unknown command: " .. command .. ". Use |cffff9933/ms help|r for available commands.")
     end
@@ -3367,8 +4182,14 @@ frame:RegisterEvent("ADDON_LOADED")
 frame:RegisterEvent("PLAYER_REGEN_DISABLED")
 frame:RegisterEvent("BAG_UPDATE")
 frame:RegisterEvent("MERCHANT_CLOSED")
+frame:RegisterEvent("PLAYER_TARGET_CHANGED")
+frame:RegisterEvent("UPDATE_MOUSEOVER_UNIT")
+frame:RegisterEvent("UNIT_DIED")
 frame:SetScript("OnEvent", function(self, event, ...)
     if event == "ADDON_LOADED" and select(1, ...) == addonName then
+        -- Initialize settings with defaults
+        InitializeSettings()
+        
         Print("The magnificent Millhouse Manastorm is at your service! Type |cffff9933/ms help|r to witness my incredible abilities!")
         print("|cffff8800I wonder if this world has any world-destroying artifacts? ...We can't allow them to fall into the hands of the enemy, you know!|r")
         
@@ -3385,6 +4206,12 @@ frame:SetScript("OnEvent", function(self, event, ...)
         
         -- Initialize dock
         ShowDock()
+        
+        -- Start NPC detection if enabled
+        if ManastormManagerDB.npcDetection then
+            StartNPCDetection()
+            DebugPrint("NPC Detection automatically started on addon load")
+        end
         
     elseif event == "PLAYER_REGEN_DISABLED" then
         -- Entered combat - stop opening if we were doing so
@@ -3434,6 +4261,55 @@ frame:SetScript("OnEvent", function(self, event, ...)
         
         -- Show session total when merchant window closes
         ShowVendorSessionTotal()
+        
+    elseif event == "PLAYER_TARGET_CHANGED" then
+        -- Check if player targeted one of our special NPCs
+        if ManastormManagerDB.npcDetection and UnitExists("target") then
+            local targetName = UnitName("target")
+            local targetNPCs = {"Clepto the Cardnapper", "Greedy Demon"}
+            
+            for _, npcName in ipairs(targetNPCs) do
+                if targetName == npcName then
+                    -- Immediate check when targeting
+                    ScanForTargetNPCs()
+                    break
+                end
+            end
+        end
+        
+    elseif event == "UPDATE_MOUSEOVER_UNIT" then
+        -- Check if player moused over one of our special NPCs
+        if ManastormManagerDB.npcDetection and UnitExists("mouseover") then
+            local mouseoverName = UnitName("mouseover")
+            local targetNPCs = {"Clepto the Cardnapper", "Greedy Demon"}
+            
+            for _, npcName in ipairs(targetNPCs) do
+                if mouseoverName == npcName then
+                    -- Immediate check when mousing over
+                    ScanForTargetNPCs()
+                    break
+                end
+            end
+        end
+        
+    elseif event == "UNIT_DIED" then
+        -- Check if the died unit was one of our tracked NPCs
+        local unitGUID = select(1, ...)
+        if unitGUID and detectedNPCs then
+            -- Try to get the name from the GUID (if available in 3.3.5a)
+            local targetNPCs = {"Clepto the Cardnapper", "Greedy Demon"}
+            for _, npcName in ipairs(targetNPCs) do
+                if detectedNPCs[npcName] then
+                    -- Clear this NPC from detection since we got a death event
+                    -- We can't be 100% sure it's the right one without GUID parsing
+                    -- but if player is in combat with it, it's likely the one
+                    if UnitExists("target") and UnitIsDead("target") and UnitName("target") == npcName then
+                        detectedNPCs[npcName] = nil
+                        DebugPrint("Cleared " .. npcName .. " from detection (unit died)")
+                    end
+                end
+            end
+        end
         
     end
 end)
